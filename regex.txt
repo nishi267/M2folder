@@ -1,0 +1,23 @@
+Interakt whatsapp API
+
+zipcode regex
+^[A-Z]{1,2}[0-9R][0-9A-Z]? [0-9][A-Z]{2}[,. ]?$
+
+phone number
+
+^\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}$
+
+website address:
+^(https?://)?(www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(\.[a-zA-Z]{2,})?$
+
+email addrress:
+^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+
+
+import re
+
+text = "This is a sample text with some VAT and registered information that should be removed. This is some more text that should also be removed."
+
+cleaned_text = re.sub(r'\b(VAT|registered)\b.*', '', text)
+cleaned_text = re.sub(r'\s*$', '', cleaned_text)
+print(cleaned_text)
