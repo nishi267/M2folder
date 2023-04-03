@@ -25,6 +25,14 @@ cleaned_text = re.sub(r'\b(VAT|registered)\b.*', '', text)
 cleaned_text = re.sub(r'\s*$', '', cleaned_text)
 print(cleaned_text)
 
+original_string = '"sample"'
+new_string = original_string.strip('"')
+print(new_string)
+
+original_string = '"sample"'
+new_string = original_string.replace('"', '')
+print(new_string)
+###########################################
 
 import nltk
 import random
