@@ -187,3 +187,66 @@ generated_texts = [tokenizer.decode(sample, skip_special_tokens=True) for sample
 # Print the generated samples
 for text in generated_texts:
     print(text)
+
+
+
+##########################################################################
+#BERT 
+
+
+import pandas as pd
+import numpy as np
+import transformers
+from transformers import BertTokenizer, BertForMaskedLM
+
+# Load pre-trained BERT model and tokenizer
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+model = BertForMaskedLM.from_pretrained('bert-base-uncased').cuda()
+
+# Define function to generate synthetic examples
+def generate_synthetic_examples(text, num_examples):
+    examples = []
+    for i in range(num_examples):
+        # Mask a random word in the text
+        masked_index = np.random.choice(len(text))
+        masked_text = list(text)
+        masked_text[masked_index] = '[MASK]'
+        masked_text = ''.join(masked_text)
+
+        # Convert masked text to input IDs and input mask
+        input_ids = tokenizer.encode(masked_text, add_special_tokens=True)
+        input_mask = [1] * len(input_ids)
+
+        # Convert input IDs and input mask to tensors
+        input_ids = torch.tensor(input_ids).unsqueeze(0).cuda()
+        input_mask = torch.tensor(input_mask).unsqueeze(0).cuda()
+
+        # Generate synthetic example using BERT model
+        with torch.no_grad():
+            output = model(input_ids, attention_mask=input_mask)
+            prediction = output[0].argmax(dim=-1)[0, masked_index].item()
+            synthetic_text = list(text)
+            synthetic_text[masked_index] = tokenizer.convert_ids_to_tokens(prediction)
+            synthetic_text = ''.join(synthetic_text)
+
+        examples.append(synthetic_text)
+
+    return examples
+
+# Load text classification dataset
+df = pd.read_csv('text_classification_dataset.csv')
+
+# Identify minority class
+minority_class = df['label'].value_counts().idxmin()
+
+# Generate synthetic examples for minority class
+minority_df = df[df['label'] == minority_class]
+num_examples = len(df) - 2*len(minority_df)
+synthetic_examples = generate_synthetic_examples(minority_df['text'].iloc[0], num_examples)
+synthetic_df = pd.DataFrame({'text': synthetic_examples, 'label': minority_class})
+
+# Concatenate original and synthetic datasets
+augmented_df = pd.concat([df, synthetic_df])
+
+# Shuffle dataset
+augmented_df = augmented_df.sample(frac=1).reset_index(drop=True)
