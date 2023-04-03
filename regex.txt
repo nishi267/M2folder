@@ -3,6 +3,7 @@ Interakt whatsapp API
 zipcode regex
 ^[A-Z]{1,2}[0-9R][0-9A-Z]? [0-9][A-Z]{2}[,. ]?$
 postcode_regex = r'\b(?:[A-Za-z][A-Ha-hJ-Yj-y]?[0-9][A-Za-z0-9]? ?[0-9][A-Za-z]{2}|[Gg][Ii][Rr] ?0[Aa]{2})\b'
+match = re.search(r"\b[0-9]{3}(?=[,. ]|$)\b", postcode)
 
 
 phone number
