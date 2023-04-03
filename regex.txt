@@ -24,3 +24,158 @@ text = "This is a sample text with some VAT and registered information that shou
 cleaned_text = re.sub(r'\b(VAT|registered)\b.*', '', text)
 cleaned_text = re.sub(r'\s*$', '', cleaned_text)
 print(cleaned_text)
+
+
+import nltk
+import random
+
+# Download the required resources for the nltk library
+nltk.download('wordnet')
+nltk.download('punkt')
+
+# Function for synonym replacement
+def synonym_replacement(sentence, n):
+    # Tokenize the sentence into words
+    words = nltk.word_tokenize(sentence)
+    
+    # Get the WordNet synonym sets for each word
+    synsets = [nltk.corpus.wordnet.synsets(word) for word in words]
+    
+    # Replace n words with their synonyms
+    for i in range(n):
+        # Choose a random word in the sentence
+        idx = random.randint(0, len(words) - 1)
+        
+        # Choose a random synonym set for the word
+        synonyms = synsets[idx]
+        if len(synonyms) > 0:
+            synonym = random.choice(synonyms).lemmas()[0].name()
+            
+            # Replace the word with its synonym
+            words[idx] = synonym
+    
+    # Reconstruct the sentence from the modified words
+    new_sentence = ' '.join(words)
+    return new_sentence
+
+# Function for random insertion
+def random_insertion(sentence, n):
+    # Tokenize the sentence into words
+    words = nltk.word_tokenize(sentence)
+    
+    # Insert n random words at random positions in the sentence
+    for i in range(n):
+        word = random.choice(nltk.corpus.words.words())
+        idx = random.randint(0, len(words))
+        words.insert(idx, word)
+    
+    # Reconstruct the sentence from the modified words
+    new_sentence = ' '.join(words)
+    return new_sentence
+
+# Function for random deletion
+def random_deletion(sentence, p):
+    # Tokenize the sentence into words
+    words = nltk.word_tokenize(sentence)
+    
+    # Delete each word with probability p
+    words = [word for word in words if random.uniform(0, 1) > p]
+    
+    # Reconstruct the sentence from the modified words
+    new_sentence = ' '.join(words)
+    return new_sentence
+
+# Function for random swap
+def random_swap(sentence, n):
+    # Tokenize the sentence into words
+    words = nltk.word_tokenize(sentence)
+    
+    # Swap adjacent words n times
+    for i in range(n):
+        idx = random.randint(0, len(words) - 2)
+        words[idx], words[idx+1] = words[idx+1], words[idx]
+    
+    # Reconstruct the sentence from the modified words
+    new_sentence = ' '.join(words)
+    return new_sentence
+
+
+
+sentence = "The quick brown fox jumps over the lazy dog"
+print(synonym_replacement(sentence, 2))
+print(random_insertion(sentence, 3))
+print(random_deletion(sentence, 0.3))
+print(random_swap(sentence, 2))
+
+
+#GPT-2 method
+
+
+import torch
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, TextDataset, DataCollatorForLanguageModeling, Trainer, TrainingArguments
+
+# Define the input and output directories
+data_dir = "./data"
+output_dir = "./output"
+
+# Load the tokenizer
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+
+# Load the minority class data
+minority_data = ["some minority class data 1", "some minority class data 2", ...]
+
+# Tokenize the minority class data
+minority_tokenized = [tokenizer.encode(text) for text in minority_data]
+
+# Concatenate the tokenized data into a single list
+all_tokenized = [tokenizer.encode(text) for text in minority_data]
+flat_tokenized = [token for sublist in all_tokenized for token in sublist]
+
+# Create a PyTorch dataset from the tokenized data
+dataset = TextDataset(flat_tokenized, tokenizer=tokenizer)
+
+# Define the data collator
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+# Initialize the GPT-2 model with the appropriate configuration
+model = GPT2LMHeadModel.from_pretrained('gpt2')
+
+# Define the training arguments
+training_args = TrainingArguments(
+    output_dir=output_dir,
+    overwrite_output_dir=True,
+    num_train_epochs=10,
+    per_device_train_batch_size=4,
+    save_steps=1000,
+    save_total_limit=5,
+    prediction_loss_only=True,
+    logging_steps=1000,
+    logging_dir='./logs',
+    seed=42,
+)
+
+# Initialize the Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    data_collator=data_collator,
+    train_dataset=dataset,
+)
+
+# Train the model
+trainer.train()
+
+# Generate new samples from the model
+generated_samples = model.generate(
+    bos_token_id=tokenizer.bos_token_id,
+    eos_token_id=tokenizer.eos_token_id,
+    num_return_sequences=10,
+    max_length=50,
+)
+
+# Decode the generated samples
+generated_texts = [tokenizer.decode(sample, skip_special_tokens=True) for sample in generated_samples]
+
+# Print the generated samples
+for text in generated_texts:
+    print(text)
