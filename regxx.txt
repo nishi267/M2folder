@@ -4,3 +4,6 @@ text = "Fax No    01235522825, Fax No01235522826, Fax No     0123 552 2827"
 fax_numbers = re.findall(r'Fax\s+No\s*\d+(?:\s+\d+)*', text)
 
 print(fax_numbers)
+
+
+text = re.sub(r'\bA(?:ND|nd)\b', '&', text)
