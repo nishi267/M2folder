@@ -4,7 +4,7 @@ decorator==4.4.2
 decord==0.0.1
 jellyfish==0.7.2
 networkx==2.4
-numpy==1.18.1
+numpy==1.22.0
 regex==2020.2.20
 segtok==1.5.7
 tabulate==0.8.6
