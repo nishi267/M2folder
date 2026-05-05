@@ -1,0 +1,324 @@
+"""
+Bot Detection: Padded Sequence Clustering
+Libraries: pandas, numpy, scikit-learn ONLY (all pre-installed)
+
+Pipeline:
+  1. Load & clean CSV
+  2. Parse pct-change strings → decimals
+  3. Clip outliers + RobustScale
+  4. Pad each UUID sequence to fixed length (left-pad zeros + mask channel)
+  5. sklearn HDBSCAN clustering
+  6. Lift table + outputs
+"""
+
+# ─────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────
+INPUT_FILE          = "nondense_with_pct_change_raw.csv"
+OUTPUT_USER_CSV     = "cluster_user_level.csv"
+OUTPUT_MERGED_CSV   = "cluster_merged.csv"
+OUTPUT_SUSPECTS_CSV = "bot_suspect_neighbors.csv"
+
+N_STEPS             = 30      # pad/truncate every UUID to this length
+MIN_VALID_CHANGES   = 5       # skip UUID if fewer valid pct-change rows
+CLIP_LOW            = -3.0    # -300%
+CLIP_HIGH           =  3.0    # +300%
+
+# HDBSCAN params (sklearn >= 1.3 has this built-in)
+HDBSCAN_MIN_CLUSTER = 30      # auto-lowered for small datasets
+HDBSCAN_MIN_SAMPLES = 5
+
+K_NEIGHBORS         = 10      # nearest non-BOT neighbours per known BOT
+
+COL_UUID  = "uuid"
+COL_DATE  = "ticketsubmissiondate"
+COL_FLAG  = "bot_flag"
+CHANNELS  = [
+    "avg_comment_length_pct_change",
+    "avg_similarity_pct_change",
+    "comment_count_pct_change",
+]
+
+# ─────────────────────────────────────────────────────────────
+import warnings; warnings.filterwarnings("ignore")
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import RobustScaler
+from sklearn.cluster import HDBSCAN          # sklearn >= 1.3, you have 1.8 ✅
+from datetime import datetime
+
+print("=" * 60)
+print("BOT DETECTION — PADDED SEQUENCE CLUSTERING")
+print(f"Started: {datetime.now():%Y-%m-%d %H:%M:%S}")
+print("Libraries: pandas / numpy / scikit-learn only")
+print("=" * 60)
+
+# ─────────────────────────────────────────────────────────────
+# STEP 1: LOAD & CLEAN
+# ─────────────────────────────────────────────────────────────
+print("\n[1/7] Loading data...")
+df = pd.read_csv(INPUT_FILE)
+df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+df.dropna(how="all", inplace=True)
+df = df[df[COL_UUID].notna() & (df[COL_UUID].astype(str).str.strip() != "")]
+df.reset_index(drop=True, inplace=True)
+print(f"      Rows: {len(df)}  |  UUIDs: {df[COL_UUID].nunique()}")
+
+# ─────────────────────────────────────────────────────────────
+# STEP 2: PARSE DATES + SORT
+# ─────────────────────────────────────────────────────────────
+print("\n[2/7] Parsing dates...")
+df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors="coerce")
+df.sort_values([COL_UUID, COL_DATE], inplace=True, na_position="last")
+df.reset_index(drop=True, inplace=True)
+
+# ─────────────────────────────────────────────────────────────
+# STEP 3: PARSE PCT STRINGS → DECIMALS
+# "60.00%" → 0.60  |  "-50.00%" → -0.50  |  NaN → NaN
+# ─────────────────────────────────────────────────────────────
+print("\n[3/7] Parsing pct-change columns...")
+
+def pct_to_decimal(series):
+    def _cvt(v):
+        if pd.isna(v): return np.nan
+        s = str(v).strip().replace("%", "")
+        if s in ("", "nan", "NaN"): return np.nan
+        try: return float(s) / 100.0
+        except ValueError: return np.nan
+    return series.apply(_cvt)
+
+for col in CHANNELS:
+    df[col] = pct_to_decimal(df[col])
+    nn = df[col].notna().sum()
+    print(f"      {col}: {nn} non-null  "
+          f"range [{df[col].min():.3f}, {df[col].max():.3f}]")
+
+# ─────────────────────────────────────────────────────────────
+# STEP 4: DROP FIRST ROW PER UUID + CLIP + SCALE
+# ─────────────────────────────────────────────────────────────
+print("\n[4/7] Dropping first-row per UUID, clipping, scaling...")
+
+df["_rank"] = df.groupby(COL_UUID).cumcount()
+df_orig = df.drop(columns=["_rank"]).copy()
+df_pct  = df[df["_rank"] > 0].drop(columns=["_rank"]).copy()
+
+# Clip
+for col in CHANNELS:
+    df_pct[col] = df_pct[col].clip(CLIP_LOW, CLIP_HIGH)
+
+# RobustScale on rows where ALL channels are valid
+valid_mask = df_pct[CHANNELS].notna().all(axis=1)
+df_pct.loc[valid_mask, CHANNELS] = RobustScaler().fit_transform(
+    df_pct.loc[valid_mask, CHANNELS]
+)
+print(f"      Rows after drop: {len(df_pct)}  |  "
+      f"Rows with all channels valid: {valid_mask.sum()}")
+
+# ─────────────────────────────────────────────────────────────
+# STEP 5: BUILD PADDED FEATURE MATRIX
+#
+# For each UUID, take last N_STEPS valid rows.
+# Pad shorter sequences on the LEFT with zeros.
+# Add a MASK channel: 1 = real obs, 0 = padded.
+#
+# Final feature vector per UUID:
+#   [ch1_t1..ch1_tN, ch2_t1..ch2_tN, ch3_t1..ch3_tN, mask_t1..mask_tN]
+#   length = N_STEPS * (len(CHANNELS) + 1)
+# ─────────────────────────────────────────────────────────────
+print("\n[5/7] Building padded feature matrix...")
+
+n_ch      = len(CHANNELS)
+feat_len  = N_STEPS * (n_ch + 1)   # +1 for mask channel
+
+uuid_list  = []
+feat_rows  = []
+meta_rows  = []
+skipped    = []
+
+for uuid, group in df_pct.groupby(COL_UUID):
+    grp     = group.dropna(subset=CHANNELS).sort_values(COL_DATE)
+    n_valid = len(grp)
+
+    if n_valid < MIN_VALID_CHANGES:
+        skipped.append((uuid, n_valid))
+        continue
+
+    grp    = grp.tail(N_STEPS)
+    n_real = len(grp)                    # may be < N_STEPS
+    n_pad  = N_STEPS - n_real            # zeros prepended
+
+    # Build padded channel arrays
+    seq    = grp[CHANNELS].values        # shape (n_real, n_ch)
+    padded = np.zeros((N_STEPS, n_ch))
+    padded[n_pad:, :] = seq              # left-pad with zeros
+
+    # Mask: 0 for padded steps, 1 for real steps
+    mask      = np.zeros(N_STEPS)
+    mask[n_pad:] = 1.0
+
+    # Flatten: channels first, then mask
+    feat_vec  = np.concatenate([padded[:, c] for c in range(n_ch)] + [mask])
+
+    dates = grp[COL_DATE].dropna()
+    uuid_list.append(uuid)
+    feat_rows.append(feat_vec)
+    meta_rows.append({
+        "uuid"            : uuid,
+        "obs_count"       : n_valid,
+        "seq_start"       : dates.min() if len(dates) else pd.NaT,
+        "seq_end"         : dates.max() if len(dates) else pd.NaT,
+        "latest_bot_flag" : grp[COL_FLAG].iloc[-1],
+    })
+
+X        = np.vstack(feat_rows)          # shape (n_uuids, feat_len)
+n_uuids  = len(uuid_list)
+df_meta  = pd.DataFrame(meta_rows)
+
+print(f"      UUIDs retained : {n_uuids}")
+print(f"      Feature matrix : {X.shape}  "
+      f"({n_ch} channels × {N_STEPS} steps + mask)")
+if skipped:
+    print(f"      UUIDs skipped  : {len(skipped)}  (< {MIN_VALID_CHANGES} valid rows)")
+    for u, n in skipped:
+        print(f"        {u[:28]}... → {n} rows")
+
+if n_uuids < 3:
+    raise SystemExit("Too few UUIDs to cluster. Lower MIN_VALID_CHANGES.")
+
+# ─────────────────────────────────────────────────────────────
+# STEP 6: HDBSCAN CLUSTERING (sklearn built-in, no extra install)
+# ─────────────────────────────────────────────────────────────
+print("\n[6/7] HDBSCAN clustering (sklearn)...")
+
+min_cls = min(HDBSCAN_MIN_CLUSTER, max(2, n_uuids // 20))
+min_smp = min(HDBSCAN_MIN_SAMPLES, max(1, n_uuids // 100))
+print(f"      min_cluster_size={min_cls}  min_samples={min_smp}")
+
+clusterer = HDBSCAN(
+    min_cluster_size = min_cls,
+    min_samples      = min_smp,
+    metric           = "euclidean",
+    store_centers    = "centroid",
+)
+labels = clusterer.fit_predict(X)
+
+n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+n_noise    = (labels == -1).sum()
+print(f"      Clusters found : {n_clusters}")
+print(f"      Noise (label=-1): {n_noise}  ({100*n_noise/n_uuids:.1f}%  — behavioral outliers)")
+
+# ─────────────────────────────────────────────────────────────
+# STEP 7: OUTPUTS + DIAGNOSTICS
+# ─────────────────────────────────────────────────────────────
+print("\n[7/7] Building outputs and diagnostics...")
+
+df_user           = df_meta.copy()
+df_user["cluster_id"] = labels.astype(int)
+
+# Add a simple 2D PCA embedding for nearest-neighbour suspect analysis
+from sklearn.decomposition import PCA
+pca_emb = PCA(n_components=min(2, n_uuids-1), random_state=42).fit_transform(X)
+if pca_emb.shape[1] < 2:
+    pca_emb = np.hstack([pca_emb, np.zeros((n_uuids, 1))])
+df_user["pca_x"] = pca_emb[:, 0]
+df_user["pca_y"] = pca_emb[:, 1]
+
+df_merged = df_orig.merge(df_user[["uuid","cluster_id"]], on=COL_UUID, how="left")
+
+# ── Cluster sizes ─────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("CLUSTER SIZES")
+print("=" * 60)
+for cid, cnt in df_user["cluster_id"].value_counts().sort_index().items():
+    tag = "NOISE/OUTLIER" if cid == -1 else f"Cluster {cid}"
+    print(f"  {tag:20s}: {cnt:5d}  ({100*cnt/n_uuids:.1f}%)")
+
+# ── Crosstab ──────────────────────────────────────────────────
+print("\nCROSSTAB: cluster vs bot_flag")
+print("=" * 60)
+print(pd.crosstab(df_user["cluster_id"], df_user["latest_bot_flag"],
+                  margins=True).to_string())
+
+# ── Lift table ────────────────────────────────────────────────
+print("\nBOT LIFT PER CLUSTER")
+print("=" * 60)
+if "BOT" in df_user["latest_bot_flag"].values:
+    overall = (df_user["latest_bot_flag"] == "BOT").mean()
+    print(f"  Overall BOT rate: {overall:.4f} ({overall*100:.2f}%)\n")
+    print(f"  {'Cluster':>10} {'N':>7} {'BOTs':>7} {'BOT%':>8} {'Lift':>8}")
+    print("  " + "-" * 47)
+    for cid in sorted(df_user["cluster_id"].unique()):
+        sub  = df_user[df_user["cluster_id"] == cid]
+        n    = len(sub)
+        nb   = (sub["latest_bot_flag"] == "BOT").sum()
+        br   = nb / n if n else 0
+        lift = br / overall if overall else 0
+        flag = "🔴 HIGH" if lift >= 3 else ("🟡 MED" if lift >= 1.5 else "🟢 LOW")
+        lbl  = "NOISE" if cid == -1 else str(cid)
+        print(f"  {lbl:>10} {n:>7} {nb:>7} {br*100:>7.2f}% {lift:>8.2f}x  {flag}")
+    print("\n  Cluster -1 (NOISE) = behavioral outliers.")
+    print("  High lift here → unusual pattern is a strong bot signal.")
+else:
+    print("  No BOT labels found in clustered UUIDs.")
+
+# ── Degenerate check ──────────────────────────────────────────
+print("\nDEGENERATE CHECK")
+max_pct = df_user["cluster_id"].value_counts().max() / n_uuids
+if n_clusters < 2:
+    print(f"  ⚠️  Only {n_clusters} cluster(s). Dataset may be too small.")
+    print("     On full 6K dataset this will produce meaningful clusters.")
+elif max_pct > 0.90:
+    print(f"  ⚠️  Dominant cluster = {max_pct*100:.0f}%. Try smaller HDBSCAN_MIN_CLUSTER.")
+else:
+    print(f"  ✅  {n_clusters} clusters, largest = {max_pct*100:.0f}%")
+
+# ── Nearest-neighbour suspects ────────────────────────────────
+print("\nNEAREST-NEIGHBOUR BOT SUSPECTS")
+print("=" * 60)
+bot_uuids = df_user[df_user["latest_bot_flag"] == "BOT"]["uuid"].tolist()
+if bot_uuids:
+    all_sus = []
+    for bot_uuid in bot_uuids:
+        brow = df_user[df_user["uuid"] == bot_uuid]
+        if brow.empty: continue
+        bx, by = brow[["pca_x","pca_y"]].values[0]
+        df_user["_d"] = np.sqrt(
+            (df_user["pca_x"] - bx)**2 + (df_user["pca_y"] - by)**2
+        )
+        nbrs = (df_user[df_user["uuid"] != bot_uuid]
+                .nsmallest(K_NEIGHBORS, "_d")
+                [["uuid","latest_bot_flag","cluster_id","_d"]].copy())
+        nbrs["reference_bot_uuid"] = bot_uuid
+        all_sus.append(nbrs)
+    df_user.drop(columns=["_d"], inplace=True)
+
+    if all_sus:
+        df_sus = (pd.concat(all_sus)
+                  .query("latest_bot_flag != 'BOT'")
+                  .drop_duplicates("uuid")
+                  .sort_values("_d"))
+        print(f"  {len(df_sus)} non-BOT UUIDs near known bots:")
+        print(df_sus.to_string(index=False))
+        df_sus.to_csv(OUTPUT_SUSPECTS_CSV, index=False)
+        print(f"\n  Saved: {OUTPUT_SUSPECTS_CSV}")
+else:
+    print("  No BOT-labelled UUIDs in clustered set.")
+
+# ── Save CSVs ─────────────────────────────────────────────────
+df_user.to_csv(OUTPUT_USER_CSV,    index=False)
+df_merged.to_csv(OUTPUT_MERGED_CSV, index=False)
+
+print("\n" + "=" * 60)
+print("DONE")
+print("=" * 60)
+print(f"  {OUTPUT_USER_CSV:<38} {len(df_user)} rows (one per UUID)")
+print(f"  {OUTPUT_MERGED_CSV:<38} {len(df_merged)} rows (original + cluster_id)")
+print(f"  {OUTPUT_SUSPECTS_CSV:<38} non-BOT UUIDs near known bots")
+print(f"\nFinished: {datetime.now():%Y-%m-%d %H:%M:%S}")
+print("""
+NEXT STEPS (on full 6K dataset):
+  1. Check lift table — clusters with lift > 3x are high priority
+  2. Cluster -1 (noise) = behavioral outliers → inspect these first
+  3. bot_suspect_neighbors.csv → candidates to re-label as SUSPECT
+  4. Add cluster_id as a feature to your 301b classifier
+""")
