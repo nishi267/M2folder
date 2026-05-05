@@ -1,0 +1,386 @@
+!pip install tslearn umap-learn hdbscan scikit-learn pandas openpyxl joblib matplotlib
+
+"""
+Bot Detection: Time-Series Clustering Pipeline
+Soft-DTW distance matrix → UMAP embedding → HDBSCAN clustering
+
+Built and tested against: nondense_with_pct_change_raw.csv
+Run on Optum with:
+    pip install tslearn umap-learn hdbscan scikit-learn pandas matplotlib joblib
+"""
+
+# ──────────────────────────────────────────────────────────────
+# CONFIGURATION  ← only section you need to touch
+# ──────────────────────────────────────────────────────────────
+INPUT_FILE          = "nondense_with_pct_change_raw.csv"
+OUTPUT_USER_CSV     = "cluster_user_level.csv"
+OUTPUT_MERGED_CSV   = "cluster_merged.csv"
+OUTPUT_SUSPECTS_CSV = "bot_suspect_neighbors.csv"
+OUTPUT_PLOT         = "umap_cluster_plot.png"
+
+N_STEPS             = 30      # last N pct-change rows per UUID
+MIN_VALID_CHANGES   = 5       # drop UUID if fewer valid pct-change rows
+CLIP_LOW            = -3.0    # winsorize lower (decimal = -300%)
+CLIP_HIGH           =  3.0    # winsorize upper (decimal = +300%)
+HDBSCAN_MIN_CLUSTER = 30      # auto-lowered for small datasets
+HDBSCAN_MIN_SAMPLES = 5
+UMAP_N_NEIGHBORS    = 15
+UMAP_MIN_DIST       = 0.1
+SOFT_DTW_GAMMA      = 0.1
+K_NEIGHBORS         = 10      # nearest non-BOT neighbours per known BOT
+N_JOBS              = -1      # -1 = all CPU cores
+
+COL_UUID  = "uuid"
+COL_DATE  = "ticketsubmissiondate"
+COL_FLAG  = "bot_flag"
+CHANNELS  = [
+    "avg_comment_length_pct_change",
+    "avg_similarity_pct_change",
+    "comment_count_pct_change",
+]
+
+# ──────────────────────────────────────────────────────────────
+import warnings; warnings.filterwarnings("ignore")
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import pairwise_distances
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from joblib import Parallel, delayed
+from datetime import datetime
+
+print("=" * 60)
+print("BOT DETECTION CLUSTERING PIPELINE")
+print(f"Started: {datetime.now():%Y-%m-%d %H:%M:%S}")
+print("=" * 60)
+
+# ── STEP 1: LOAD & CLEAN ──────────────────────────────────────
+print("\n[1/9] Loading data...")
+df = pd.read_csv(INPUT_FILE)
+df = df.loc[:, ~df.columns.str.startswith("Unnamed")]   # drop trailing comma cols
+df.dropna(how="all", inplace=True)                       # drop fully blank rows
+df = df[df[COL_UUID].notna() & (df[COL_UUID].astype(str).str.strip() != "")]
+df.reset_index(drop=True, inplace=True)
+print(f"      Rows: {len(df)}  |  UUIDs: {df[COL_UUID].nunique()}")
+
+# ── STEP 2: PARSE DATES ───────────────────────────────────────
+print("\n[2/9] Parsing dates...")
+df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors="coerce")
+bad = df[COL_DATE].isna().sum()
+if bad:
+    print(f"      {bad} unparseable dates set to NaT (won't affect clustering)")
+df.sort_values([COL_UUID, COL_DATE], inplace=True, na_position="last")
+df.reset_index(drop=True, inplace=True)
+
+# ── STEP 3: PARSE PCT-CHANGE STRINGS → DECIMALS ───────────────
+print("\n[3/9] Parsing pct-change columns...")
+
+def pct_to_decimal(series):
+    def _cvt(v):
+        if pd.isna(v):
+            return np.nan
+        s = str(v).strip().replace("%", "")
+        if s in ("", "nan", "NaN"):
+            return np.nan
+        try:
+            return float(s) / 100.0
+        except ValueError:
+            return np.nan
+    return series.apply(_cvt)
+
+for col in CHANNELS:
+    df[col] = pct_to_decimal(df[col])
+    nn = df[col].notna().sum()
+    lo, hi = df[col].min(), df[col].max()
+    print(f"      {col}: {nn} non-null  range [{lo:.3f}, {hi:.3f}]")
+
+# ── STEP 4: DROP FIRST ROW PER UUID ──────────────────────────
+print("\n[4/9] Dropping first row per UUID (pct-change undefined there)...")
+df["_rank"] = df.groupby(COL_UUID).cumcount()
+df_orig = df.drop(columns=["_rank"]).copy()    # keep full data for merge
+df_pct  = df[df["_rank"] > 0].drop(columns=["_rank"]).copy()
+print(f"      Rows remaining: {len(df_pct)}")
+
+# ── STEP 5: CLIP + SCALE ──────────────────────────────────────
+print("\n[5/9] Clipping outliers and robust-scaling...")
+for col in CHANNELS:
+    df_pct[col] = df_pct[col].clip(CLIP_LOW, CLIP_HIGH)
+
+valid_mask = df_pct[CHANNELS].notna().all(axis=1)
+print(f"      Rows with all channels valid: {valid_mask.sum()} / {len(df_pct)}")
+df_pct.loc[valid_mask, CHANNELS] = RobustScaler().fit_transform(
+    df_pct.loc[valid_mask, CHANNELS]
+)
+
+# ── STEP 6: BUILD SEQUENCES ───────────────────────────────────
+print("\n[6/9] Building per-UUID sequences...")
+uuid_sequences, uuid_meta, skipped = {}, {}, []
+
+for uuid, group in df_pct.groupby(COL_UUID):
+    grp = group.dropna(subset=CHANNELS).sort_values(COL_DATE)
+    n_valid = len(grp)
+    if n_valid < MIN_VALID_CHANGES:
+        skipped.append((uuid, n_valid))
+        continue
+    grp = grp.tail(N_STEPS)
+    dates = grp[COL_DATE].dropna()
+    uuid_sequences[uuid] = grp[CHANNELS].values.astype(np.float64)
+    uuid_meta[uuid] = {
+        "obs_count"       : n_valid,
+        "seq_start"       : dates.min() if len(dates) else pd.NaT,
+        "seq_end"         : dates.max() if len(dates) else pd.NaT,
+        "latest_bot_flag" : grp[COL_FLAG].iloc[-1],
+    }
+
+n_uuids   = len(uuid_sequences)
+uuid_list = list(uuid_sequences.keys())
+sequences = [uuid_sequences[u] for u in uuid_list]
+
+print(f"      UUIDs retained: {n_uuids}")
+if skipped:
+    print(f"      UUIDs skipped : {len(skipped)} (< {MIN_VALID_CHANGES} valid rows)")
+    for u, n in skipped:
+        print(f"        {u[:24]}... → {n} rows")
+
+if n_uuids < 3:
+    raise SystemExit("Not enough UUIDs to cluster. Lower MIN_VALID_CHANGES.")
+
+# ── STEP 7: SOFT-DTW DISTANCE MATRIX ─────────────────────────
+print(f"\n[7/9] Soft-DTW distance matrix ({n_uuids}×{n_uuids})...")
+if n_uuids > 500:
+    print("      Large dataset — ~20-40 min on 8 cores. Go get coffee.")
+
+try:
+    from tslearn.metrics import soft_dtw
+
+    def _row(i):
+        row = np.zeros(n_uuids)
+        for j in range(i, n_uuids):
+            d = (soft_dtw(sequences[i], sequences[j], gamma=SOFT_DTW_GAMMA) +
+                 soft_dtw(sequences[j], sequences[i], gamma=SOFT_DTW_GAMMA)) / 2.0
+            row[j] = d
+        return i, row
+
+    results = Parallel(n_jobs=N_JOBS, verbose=2)(delayed(_row)(i) for i in range(n_uuids))
+    dist_matrix = np.zeros((n_uuids, n_uuids))
+    for i, row in results:
+        dist_matrix[i, i:] = row[i:]
+        dist_matrix[i:, i] = row[i:]
+    dist_matrix = np.maximum(dist_matrix, 0.0)
+    np.fill_diagonal(dist_matrix, 0.0)
+    print(f"      Done. Range [{dist_matrix.min():.4f}, {dist_matrix.max():.4f}]")
+
+except ImportError:
+    print("      tslearn missing → Euclidean fallback (pip install tslearn for DTW)")
+    max_len = max(s.shape[0] for s in sequences)
+    padded  = np.zeros((n_uuids, max_len * len(CHANNELS)))
+    for i, seq in enumerate(sequences):
+        flat = seq.flatten()
+        padded[i, :len(flat)] = flat
+    dist_matrix = pairwise_distances(padded, metric="euclidean")
+
+# ── STEP 8: UMAP + HDBSCAN ───────────────────────────────────
+print("\n[8/9] UMAP dimensionality reduction + HDBSCAN clustering...")
+
+try:
+    import umap as umap_lib
+    _HAVE_UMAP = True
+except ImportError:
+    _HAVE_UMAP = False
+    print("      umap-learn not installed. Using PCA fallback (pip install umap-learn for real results)")
+
+try:
+    import hdbscan as hdbscan_lib
+    _HAVE_HDBSCAN = True
+except ImportError:
+    _HAVE_HDBSCAN = False
+    print("      hdbscan not installed. Using sklearn AgglomerativeClustering fallback (pip install hdbscan)")
+
+# ── UMAP (or PCA fallback) ───────────────────────────────────
+if _HAVE_UMAP:
+    umap_init = "random" if n_uuids < 50 else "spectral"
+    reducer = umap_lib.UMAP(
+        n_components = 2,
+        metric       = "precomputed",
+        n_neighbors  = min(UMAP_N_NEIGHBORS, n_uuids - 1),
+        min_dist     = UMAP_MIN_DIST,
+        init         = umap_init,
+        random_state = 42,
+        n_jobs       = 1,
+    )
+    embedding = reducer.fit_transform(dist_matrix)
+    print(f"      UMAP embedding: {embedding.shape}  (init='{umap_init}')")
+else:
+    # PCA on distance matrix as fallback
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+    pca = PCA(n_components=min(2, n_uuids - 1), random_state=42)
+    embedding = pca.fit_transform(StandardScaler().fit_transform(dist_matrix))
+    # Pad to 2 cols if only 1 component
+    if embedding.shape[1] < 2:
+        embedding = np.hstack([embedding, np.zeros((n_uuids, 1))])
+    print(f"      PCA fallback embedding: {embedding.shape}")
+
+# ── HDBSCAN (or Agglomerative fallback) ──────────────────────
+if n_uuids < 10:
+    print(f"      WARNING: only {n_uuids} UUIDs — too few for real clustering.")
+    print("      Assigning all to cluster 0. Run on full 6K dataset for real results.")
+    labels     = np.zeros(n_uuids, dtype=int)
+    n_clusters = 1
+    n_noise    = 0
+elif _HAVE_HDBSCAN:
+    min_cls = min(HDBSCAN_MIN_CLUSTER, max(2, n_uuids // 20))
+    min_smp = min(HDBSCAN_MIN_SAMPLES, max(1, n_uuids // 100))
+    clusterer = hdbscan_lib.HDBSCAN(
+        min_cluster_size         = min_cls,
+        min_samples              = min_smp,
+        metric                   = "euclidean",
+        cluster_selection_method = "eom",
+        prediction_data          = True,
+    )
+    labels     = clusterer.fit_predict(embedding)
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    n_noise    = (labels == -1).sum()
+else:
+    # Agglomerative fallback (sklearn)
+    from sklearn.cluster import AgglomerativeClustering
+    n_cls_fallback = min(5, max(2, n_uuids // 10))
+    clusterer = AgglomerativeClustering(n_clusters=n_cls_fallback, metric="euclidean", linkage="ward")
+    labels     = clusterer.fit_predict(embedding)
+    n_clusters = len(set(labels))
+    n_noise    = 0
+    print(f"      AgglomerativeClustering fallback: k={n_cls_fallback}")
+
+print(f"      Clusters: {n_clusters}  |  Noise/outlier UUIDs: {n_noise} ({100*n_noise/n_uuids:.1f}%)")
+
+# ── STEP 9: OUTPUTS + DIAGNOSTICS ────────────────────────────
+print("\n[9/9] Building outputs...")
+
+df_user = pd.DataFrame([
+    {
+        "uuid"            : uuid_list[i],
+        "cluster_id"      : int(labels[i]),
+        "obs_count"       : uuid_meta[uuid_list[i]]["obs_count"],
+        "seq_start"       : uuid_meta[uuid_list[i]]["seq_start"],
+        "seq_end"         : uuid_meta[uuid_list[i]]["seq_end"],
+        "latest_bot_flag" : uuid_meta[uuid_list[i]]["latest_bot_flag"],
+        "umap_x"          : float(embedding[i, 0]),
+        "umap_y"          : float(embedding[i, 1]),
+    }
+    for i in range(n_uuids)
+])
+
+df_merged = df_orig.merge(df_user[["uuid","cluster_id"]], on=COL_UUID, how="left")
+
+# Cluster sizes
+print("\n" + "=" * 60)
+print("CLUSTER SIZES")
+print("=" * 60)
+for cid, cnt in df_user["cluster_id"].value_counts().sort_index().items():
+    tag = "NOISE/OUTLIER" if cid == -1 else f"Cluster {cid}"
+    print(f"  {tag:20s}: {cnt:5d}  ({100*cnt/n_uuids:.1f}%)")
+
+# Crosstab
+print("\nCROSSTAB: cluster vs bot_flag")
+print("=" * 60)
+print(pd.crosstab(df_user["cluster_id"], df_user["latest_bot_flag"], margins=True).to_string())
+
+# Lift
+print("\nBOT LIFT PER CLUSTER")
+print("=" * 60)
+if "BOT" in df_user["latest_bot_flag"].values:
+    overall = (df_user["latest_bot_flag"] == "BOT").mean()
+    print(f"  Overall BOT rate: {overall:.4f} ({overall*100:.2f}%)\n")
+    print(f"  {'Cluster':>10} {'N':>7} {'BOTs':>7} {'BOT%':>8} {'Lift':>8} {'':>8}")
+    print("  " + "-" * 52)
+    for cid in sorted(df_user["cluster_id"].unique()):
+        sub  = df_user[df_user["cluster_id"] == cid]
+        n    = len(sub)
+        nb   = (sub["latest_bot_flag"] == "BOT").sum()
+        br   = nb / n if n else 0
+        lift = br / overall if overall else 0
+        flag = "🔴 HIGH" if lift >= 3 else ("🟡 MED" if lift >= 1.5 else "🟢 LOW")
+        lbl  = "NOISE" if cid == -1 else str(cid)
+        print(f"  {lbl:>10} {n:>7} {nb:>7} {br*100:>7.2f}% {lift:>8.2f}x  {flag}")
+    print("\n  NOTE: cluster -1 = noise = behavioral outliers")
+    print("        High lift here → unusual pattern strongly linked to BOT")
+
+# Degenerate check
+print("\nDEGENERATE CHECK")
+max_pct = df_user["cluster_id"].value_counts().max() / n_uuids
+if n_clusters < 2:
+    print("  ⚠️  Only 1 cluster — reduce HDBSCAN_MIN_CLUSTER")
+elif max_pct > 0.90:
+    print(f"  ⚠️  Dominant cluster = {max_pct*100:.0f}% — try smaller HDBSCAN_MIN_CLUSTER")
+else:
+    print(f"  ✅  {n_clusters} clusters, largest = {max_pct*100:.0f}%")
+
+# Nearest-neighbour suspects
+print("\nNEAREST-NEIGHBOUR BOT SUSPECTS")
+print("=" * 60)
+bot_uuids = df_user[df_user["latest_bot_flag"] == "BOT"]["uuid"].tolist()
+if bot_uuids:
+    all_suspects = []
+    for bot_uuid in bot_uuids:
+        brow = df_user[df_user["uuid"] == bot_uuid]
+        if brow.empty:
+            continue
+        bx, by = brow[["umap_x","umap_y"]].values[0]
+        df_user["_d"] = np.sqrt((df_user["umap_x"]-bx)**2 + (df_user["umap_y"]-by)**2)
+        nbrs = (df_user[df_user["uuid"] != bot_uuid]
+                .nsmallest(K_NEIGHBORS, "_d")
+                [["uuid","latest_bot_flag","cluster_id","_d"]].copy())
+        nbrs["reference_bot_uuid"] = bot_uuid
+        all_suspects.append(nbrs)
+    df_user.drop(columns=["_d"], inplace=True)
+
+    if all_suspects:
+        df_sus = (pd.concat(all_suspects)
+                  .query("latest_bot_flag != 'BOT'")
+                  .drop_duplicates("uuid")
+                  .sort_values("_d"))
+        print(f"  {len(df_sus)} unique non-BOT UUIDs near known bots (top 20):")
+        print(df_sus.head(20).to_string(index=False))
+        df_sus.to_csv(OUTPUT_SUSPECTS_CSV, index=False)
+        print(f"\n  Saved: {OUTPUT_SUSPECTS_CSV}")
+else:
+    print("  No BOT-labelled UUIDs in clustered set.")
+
+# UMAP plot
+print("\nSaving UMAP plot...")
+FLAG_C = {"NON BOT":"#90EE90","SUSPECT":"#FFA500","PROSPECT":"#FFD700","BOT":"#FF0000"}
+FLAG_M = {"NON BOT":"o","SUSPECT":"^","PROSPECT":"D","BOT":"*"}
+cmap   = plt.get_cmap("tab20", max(n_clusters, 1))
+
+fig, ax = plt.subplots(figsize=(12, 9))
+for idx, cid in enumerate(sorted(df_user["cluster_id"].unique())):
+    sub = df_user[df_user["cluster_id"] == cid]
+    col = "#DDDDDD" if cid == -1 else cmap(idx)
+    lbl = f"Noise (n={len(sub)})" if cid == -1 else f"Cluster {cid} (n={len(sub)})"
+    ax.scatter(sub["umap_x"], sub["umap_y"], c=[col], s=50, alpha=0.4, label=lbl, zorder=2)
+for flag, grp in df_user.groupby("latest_bot_flag"):
+    ax.scatter(grp["umap_x"], grp["umap_y"],
+               c=FLAG_C.get(flag,"#888"), marker=FLAG_M.get(flag,"o"),
+               s=250 if flag=="BOT" else 70,
+               edgecolors="black", linewidths=0.6, label=flag, zorder=5)
+ax.set_title("UMAP · Soft-DTW → UMAP → HDBSCAN\nbackground=cluster  overlay=bot_flag", fontsize=13)
+ax.set_xlabel("UMAP dim 1"); ax.set_ylabel("UMAP dim 2")
+ax.legend(fontsize=8, framealpha=0.85)
+plt.tight_layout()
+plt.savefig(OUTPUT_PLOT, dpi=150, bbox_inches="tight")
+plt.close()
+print(f"  Saved: {OUTPUT_PLOT}")
+
+# Save CSVs
+df_user.to_csv(OUTPUT_USER_CSV,   index=False)
+df_merged.to_csv(OUTPUT_MERGED_CSV, index=False)
+
+print("\n" + "=" * 60)
+print("DONE")
+print("=" * 60)
+print(f"  {OUTPUT_USER_CSV:<38} {len(df_user)} rows")
+print(f"  {OUTPUT_MERGED_CSV:<38} {len(df_merged)} rows")
+print(f"  {OUTPUT_SUSPECTS_CSV:<38} nearest non-BOT neighbours")
+print(f"  {OUTPUT_PLOT:<38} UMAP scatter plot")
+print(f"\nFinished: {datetime.now():%Y-%m-%d %H:%M:%S}")
