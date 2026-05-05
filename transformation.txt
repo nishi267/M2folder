@@ -1,0 +1,191 @@
+"""
+UUID Aggregation Pipeline
+Converts raw multi-row-per-UUID data → one row per UUID for model training.
+
+Input columns:
+    uuid, ticketsubmissiondate, comment_count,
+    average_comment_length, average_similarity, 30lb_bot_flag
+
+Output columns:
+    uuid | ticketsubmissiondate | sim_sum | sim_flag_ct |
+    pattern_repeat_ratio | comm_ct | activ_day | bot_flag
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# ─────────────────────────────────────────────
+# CONFIGURATION  ← only change this section
+# ─────────────────────────────────────────────
+INPUT_FILE  = "your_raw_data.csv"    # ← your file path
+OUTPUT_FILE = "aggregated_uuid.csv"
+
+COL_UUID  = "uuid"
+COL_DATE  = "ticketsubmissiondate"
+COL_COUNT = "comment_count"
+COL_ACL   = "average_comment_length"
+COL_SIM   = "average_similarity"
+COL_FLAG  = "30lb_bot_flag"
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+
+def parse_pct(val):
+    """
+    Converts avg_similarity to decimal regardless of input format:
+    '99.85%' → 0.9985  |  99.85 → 0.9985  |  0.9985 → 0.9985  |  NaN → NaN
+    """
+    if pd.isna(val):
+        return np.nan
+    if isinstance(val, str):
+        s = val.strip().replace("%", "")
+        if s in ("", "nan"):
+            return np.nan
+        try:
+            v = float(s)
+            return v / 100.0 if v > 1.0 else v
+        except ValueError:
+            return np.nan
+    v = float(val)
+    return v / 100.0 if v > 1.0 else v
+
+
+def rad(a, b):
+    """
+    Relative Absolute Difference similarity between two consecutive values.
+
+    Formula : 1 - |a - b| / MAX(|a|, |b|)
+    Range   : 0.0 (completely different) → 1.0 (identical)
+    Edge    : both zero → returns 1.0 (consistently zero = consistent behaviour)
+
+    Why date gaps don't matter:
+        Only compares the two values that exist. A bot stays consistent
+        whether it returns after 1 day or 7 days — gap size works in
+        your favour as humans drift more over longer gaps.
+    """
+    denom = max(abs(a), abs(b))
+    if denom == 0:
+        return 1.0
+    return 1.0 - abs(a - b) / denom
+
+
+# ─────────────────────────────────────────────
+# PIPELINE
+# ─────────────────────────────────────────────
+print("=" * 55)
+print("UUID AGGREGATION PIPELINE")
+print(f"Started: {datetime.now():%Y-%m-%d %H:%M:%S}")
+print("=" * 55)
+
+# ── Step 1: Load ──────────────────────────────
+print(f"\n[1/5] Loading {INPUT_FILE}...")
+df = pd.read_csv(INPUT_FILE)
+df = df.loc[:, ~df.columns.str.startswith("Unnamed")]  # drop trailing comma cols
+df.dropna(how="all", inplace=True)                     # drop blank rows
+df = df[df[COL_UUID].notna() & (df[COL_UUID].astype(str).str.strip() != "")]
+df.reset_index(drop=True, inplace=True)
+print(f"      Rows: {len(df)}  |  UUIDs: {df[COL_UUID].nunique()}")
+
+# ── Step 2: Parse dates ───────────────────────
+# format='mixed' handles both '3/30/2026' and '04-01-2026' in same column
+print("\n[2/5] Parsing dates...")
+df[COL_DATE] = pd.to_datetime(df[COL_DATE], format="mixed", errors="coerce")
+bad = df[COL_DATE].isna().sum()
+if bad:
+    print(f"      WARNING: {bad} unparseable dates dropped")
+    df = df[df[COL_DATE].notna()]
+print(f"      Date range: {df[COL_DATE].min().date()} → {df[COL_DATE].max().date()}")
+
+# ── Step 3: Parse and validate columns ────────
+print("\n[3/5] Parsing columns...")
+df[COL_SIM]   = df[COL_SIM].apply(parse_pct)
+df[COL_ACL]   = pd.to_numeric(df[COL_ACL],   errors="coerce")
+df[COL_COUNT] = pd.to_numeric(df[COL_COUNT], errors="coerce")
+
+before = len(df)
+df.dropna(subset=[COL_ACL, COL_SIM], inplace=True)
+if len(df) < before:
+    print(f"      Dropped {before - len(df)} rows with missing acl/sim")
+
+print(f"      avg_similarity     : [{df[COL_SIM].min():.4f}, {df[COL_SIM].max():.4f}]")
+print(f"      avg_comment_length : [{df[COL_ACL].min():.1f}, {df[COL_ACL].max():.1f}]")
+
+# ── Step 4: Aggregate one row per UUID ────────
+print("\n[4/5] Aggregating...")
+
+output_rows = []
+
+for uuid, grp in df.groupby(COL_UUID):
+
+    grp = grp.sort_values(COL_DATE).reset_index(drop=True)
+    n   = len(grp)
+
+    # Latest row → comm_ct and bot_flag
+    latest    = grp.iloc[-1]
+    comm_ct   = latest[COL_COUNT]
+    bot_flag  = latest[COL_FLAG]
+    last_date = latest[COL_DATE]
+
+    # Active days = number of distinct dates
+    activ_day = grp[COL_DATE].nunique()
+
+    if n < 2:
+        # Only 1 record — no consecutive pairs possible
+        output_rows.append({
+            "uuid"                 : uuid,
+            "ticketsubmissiondate" : last_date,
+            "sim_sum"              : np.nan,
+            "sim_flag_ct"          : 0,
+            "pattern_repeat_ratio" : np.nan,
+            "comm_ct"              : comm_ct,
+            "activ_day"            : activ_day,
+            "bot_flag"             : bot_flag,
+        })
+        continue
+
+    acl_vals = grp[COL_ACL].values.astype(float)
+    sim_vals = grp[COL_SIM].values.astype(float)
+
+    # RAD score for every consecutive pair across both features
+    acl_scores = [rad(acl_vals[i-1], acl_vals[i]) for i in range(1, n)]
+    sim_scores = [rad(sim_vals[i-1], sim_vals[i]) for i in range(1, n)]
+
+    sim_sum       = sum(acl_scores) + sum(sim_scores)   # combined both features
+    sim_flag_ct   = (n - 1) * 2                         # total pairs × 2 features
+    pattern_ratio = sim_sum / sim_flag_ct                # average similarity score
+
+    output_rows.append({
+        "uuid"                 : uuid,
+        "ticketsubmissiondate" : last_date,
+        "sim_sum"              : round(sim_sum,        2),
+        "sim_flag_ct"          : sim_flag_ct,
+        "pattern_repeat_ratio" : round(pattern_ratio,  2),
+        "comm_ct"              : comm_ct,
+        "activ_day"            : activ_day,
+        "bot_flag"             : bot_flag,
+    })
+
+df_out = pd.DataFrame(output_rows)
+
+# Enforce 2 decimal places on all float columns
+for col in ["sim_sum", "pattern_repeat_ratio"]:
+    df_out[col] = df_out[col].round(2)
+
+# comm_ct and activ_day are integers
+df_out["comm_ct"]   = df_out["comm_ct"].astype("Int64")    # nullable int (handles NaN)
+df_out["activ_day"] = df_out["activ_day"].astype("Int64")
+df_out["sim_flag_ct"] = df_out["sim_flag_ct"].astype("Int64")
+
+print(f"      Output rows: {len(df_out)}")
+
+# ── Step 5: Save and summarise ────────────────
+print("\n[5/5] Output:")
+print(df_out.to_string(index=False))
+print(f"\nBot flag distribution:")
+print(df_out["bot_flag"].value_counts().to_string())
+
+df_out.to_csv(OUTPUT_FILE, index=False, float_format="%.2f")
+print(f"\nSaved → {OUTPUT_FILE}")
+print(f"Finished: {datetime.now():%Y-%m-%d %H:%M:%S}")
