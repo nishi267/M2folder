@@ -1,0 +1,39 @@
+1. RAD — Relative Absolute Difference ✅ RECOMMENDED
+   score = 1 - |a - b| / MAX(|a|, |b|)
+   Disadvantage: Returns 1.0 when both values are zero, 
+   which may misrepresent true similarity in edge cases.
+
+2. Absolute Difference ❌ Not suitable
+   score = |a - b|
+   Disadvantage: Not normalised so incomparable across 
+   features on different scales (comment_length vs similarity).
+
+3. Percentage Change ⚠️ Partially suitable
+   score = |a - b| / a × 100
+   Disadvantage: Breaks when starting value a = 0 and 
+   gives different results depending on direction (a→b vs b→a).
+
+4. Normalised Absolute Difference Min-Max ⚠️ Globally dependent
+   score = 1 - |a - b| / (global_max - global_min)
+   Disadvantage: Requires knowing global min and max upfront 
+   so breaks in production if new data falls outside training range.
+
+5. SMAPE — Symmetric Mean Absolute Percentage Error ⚠️ Can break
+   score = 1 - (|a - b| / ((|a| + |b|) / 2))
+   Disadvantage: Goes negative when the difference is larger 
+   than the average of the two values requiring additional clipping.
+
+6. Ratio-based similarity 🟡 Same as RAD for positive values
+   score = MIN(a, b) / MAX(a, b)
+   Disadvantage: Mathematically identical to RAD for positive 
+   values so adds no new information over your existing formula.
+
+7. CV — Coefficient of Variation 🟡 Complementary not replacement
+   score = 1 - (std(all_values) / mean(all_values))
+   Disadvantage: Ignores the order of values entirely so two 
+   UUIDs with same values in different sequences score identically.
+
+8. Cosine Similarity ❌ Not suitable for scalars
+   score = (a × b) / (|a| × |b|)
+   Disadvantage: Always returns 1.0 for any two positive scalars 
+   so cannot distinguish identical values from completely different ones.
