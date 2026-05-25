@@ -1,0 +1,323 @@
+"""
+30-Day Bot Scoring Pipeline
+Consistency-based scoring logic for BOT vs SUSPECT classification.
+
+Fully parameterised — add/remove features and bins in CONFIG only.
+No code changes needed for tuning.
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# ══════════════════════════════════════════════════════════════
+# CONFIG — only section you need to change
+# ══════════════════════════════════════════════════════════════
+
+INPUT_FILE  = "outlier_detection_results_with_CVs.csv"
+OUTPUT_FILE = "scored_30day_results.csv"
+
+COL_UUID        = "uuid"
+COL_MODEL_LABEL = "Model_label"   # column with BOT / NON BOT
+BOT_LABEL       = "BOT"           # exact string for BOT rows
+
+# ── Label thresholds ──────────────────────────────────────────
+BOT_THRESHOLD     = 8.5   # >= this → BOT
+# anything below   → SUSPECT
+
+# ── Feature scoring config ────────────────────────────────────
+# Each feature has:
+#   col     : exact column name in your CSV
+#   weight  : contribution to final score
+#   bins    : list of (upper_bound, score)
+#             processed LOW to HIGH
+#             last bin has upper_bound=None (catches everything above)
+#
+# For INVERSE features (lower value = higher score e.g. CV_sim):
+#   set inverse=True — bins are then applied HIGH to LOW
+
+FEATURE_CONFIG = [
+    {
+        "col"    : "active_day_ct",
+        "weight" : 1.0,
+        "inverse": False,
+        "bins"   : [
+            (5,    0),
+            (15,   5),
+            (20,   7.5),
+            (None, 10),
+        ],
+    },
+    {
+        "col"    : "CV_sim",
+        "weight" : 1.0,
+        "inverse": True,    # lower CV = more consistent = higher score
+        "bins"   : [
+            (0.02,  10),
+            (0.05,  7.5),
+            (0.1,   5),
+            (0.2,   0),
+            (None, -5),
+        ],
+    },
+    {
+        "col"    : "CV_len",
+        "weight" : 1.0,
+        "inverse": True,    # lower CV = more consistent = higher score
+        "bins"   : [
+            (0.02,  10),
+            (0.05,  7.5),
+            (0.1,   5),
+            (0.2,   0),
+            (None, -5),
+        ],
+    },
+    {
+        "col"    : "pattern_repeat_ratio",
+        "weight" : 1.0,
+        "inverse": False,
+        "bins"   : [
+            (0.97,  0),
+            (0.98,  5),
+            (None, 10),
+        ],
+    },
+    {
+        "col"    : "Avg_sim",
+        "weight" : 1.0,
+        "inverse": False,
+        "bins"   : [
+            (0.97,  0),
+            (0.98,  5),
+            (None, 10),
+        ],
+    },
+    {
+        "col"    : "total_comm_ct",
+        "weight" : 1.0,
+        "inverse": False,
+        "bins"   : [
+            (100,   5),
+            (200,   7.5),
+            (None, 10),
+        ],
+    },
+    {
+        "col"    : "avg_mean_comm_len",
+        "weight" : 0.5,
+        "inverse": False,
+        "bins"   : [
+            (50,    0),
+            (200,   5),
+            (500,   7.5),
+            (None, 10),
+        ],
+    },
+]
+
+# ══════════════════════════════════════════════════════════════
+# SCORING ENGINE — no changes needed below this line
+# ══════════════════════════════════════════════════════════════
+
+def apply_bins(value, bins, inverse):
+    """
+    Apply bin rules to a single value.
+
+    Normal  (inverse=False): bins go LOW → HIGH
+      e.g. active_day_ct: <5→0, 5-15→5, 15-20→7.5, >20→10
+
+    Inverse (inverse=True) : bins go HIGH → LOW
+      e.g. CV_sim: <0.02→10, 0.02-0.05→7.5, ..., >0.2→-5
+
+    Each bin is (upper_bound, score).
+    None as upper_bound = catch-all for remaining values.
+    """
+    if pd.isna(value):
+        return np.nan
+
+    for upper_bound, score in bins:
+        if upper_bound is None:
+            return score
+        if value <= upper_bound:
+            return score
+
+    # Should never reach here if last bin has None
+    return np.nan
+
+
+def score_row(row, feature_config):
+    """
+    Score one row across all features.
+    Returns dict of individual scores + weighted sum + final score.
+    """
+    total_weight  = sum(f["weight"] for f in feature_config)
+    weighted_sum  = 0.0
+    detail        = {}
+
+    for feat in feature_config:
+        col     = feat["col"]
+        weight  = feat["weight"]
+        inverse = feat["inverse"]
+        bins    = feat["bins"]
+
+        raw_val = row.get(col, np.nan)
+        score   = apply_bins(raw_val, bins, inverse)
+
+        detail[f"score_{col}"] = score
+
+        if not pd.isna(score):
+            weighted_sum += score * weight
+
+    final_score = weighted_sum / total_weight if total_weight > 0 else np.nan
+    detail["final_score"]    = round(final_score, 2)
+    detail["total_weight"]   = total_weight
+
+    return detail
+
+
+def assign_label(score):
+    """
+    Assign final label based on score thresholds.
+    Only BOT and SUSPECT — no PROSPECT.
+    """
+    if pd.isna(score):
+        return "UNKNOWN"
+    if score >= BOT_THRESHOLD:
+        return "BOT"
+    return "SUSPECT"
+
+
+# ══════════════════════════════════════════════════════════════
+# PIPELINE
+# ══════════════════════════════════════════════════════════════
+print("=" * 60)
+print("30-DAY BOT SCORING PIPELINE")
+print(f"Started: {datetime.now():%Y-%m-%d %H:%M:%S}")
+print("=" * 60)
+
+# ── Load ──────────────────────────────────────────────────────
+print(f"\n[1/5] Loading {INPUT_FILE}...")
+df = pd.read_csv(INPUT_FILE)
+df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+df.dropna(how="all", inplace=True)
+print(f"      Rows: {len(df)}  |  UUIDs: {df[COL_UUID].nunique()}")
+print(f"      Label distribution:\n"
+      f"{df[COL_MODEL_LABEL].value_counts().to_string()}")
+
+# ── Validate columns ──────────────────────────────────────────
+print(f"\n[2/5] Validating feature columns...")
+missing = [f["col"] for f in FEATURE_CONFIG if f["col"] not in df.columns]
+if missing:
+    raise ValueError(
+        f"Missing columns in input: {missing}\n"
+        f"Available: {df.columns.tolist()}"
+    )
+for feat in FEATURE_CONFIG:
+    df[feat["col"]] = pd.to_numeric(df[feat["col"]], errors="coerce")
+    nn = df[feat["col"]].notna().sum()
+    print(f"      {feat['col']:<30} {nn} non-null  "
+          f"weight={feat['weight']}")
+
+# ── Score BOT rows only ───────────────────────────────────────
+print(f"\n[3/5] Scoring BOT rows...")
+bot_mask = df[COL_MODEL_LABEL] == BOT_LABEL
+df_bots  = df[bot_mask].copy().reset_index(drop=True)
+n_bots   = len(df_bots)
+print(f"      BOT rows to score: {n_bots}")
+
+if n_bots == 0:
+    raise SystemExit(f"No rows with {COL_MODEL_LABEL}=='{BOT_LABEL}' found.")
+
+# Apply scoring row by row
+score_records = df_bots.apply(
+    lambda row: score_row(row.to_dict(), FEATURE_CONFIG),
+    axis=1
+)
+df_scores = pd.DataFrame(score_records.tolist())
+
+# Merge scores into bot df
+df_bots = pd.concat([
+    df_bots.reset_index(drop=True),
+    df_scores.reset_index(drop=True)
+], axis=1)
+
+# Assign final label
+df_bots["final_label"] = df_bots["final_score"].apply(assign_label)
+
+# ── Merge back to full dataset ────────────────────────────────
+print(f"\n[4/5] Merging scores back to full dataset...")
+
+score_cols = (
+    [f"score_{f['col']}" for f in FEATURE_CONFIG]
+    + ["final_score", "final_label"]
+)
+score_cols = [c for c in score_cols if c in df_bots.columns]
+
+df_out = df.merge(
+    df_bots[[COL_UUID] + score_cols],
+    on=COL_UUID,
+    how="left"
+)
+
+# NON BOT rows — keep their original label
+df_out["final_label"] = df_out["final_label"].fillna(
+    df_out[COL_MODEL_LABEL]
+)
+
+# ── Diagnostics ───────────────────────────────────────────────
+print(f"\n{'='*60}")
+print("RESULTS")
+print(f"{'='*60}")
+
+print(f"\nFinal label distribution:")
+print(df_out["final_label"].value_counts().to_string())
+
+print(f"\nFinal score stats (BOT rows only):")
+print(df_bots["final_score"].describe().round(2).to_string())
+
+print(f"\nIndividual feature score breakdown (BOT rows, mean):")
+for feat in FEATURE_CONFIG:
+    col      = f"score_{feat['col']}"
+    mean_val = df_bots[col].mean()
+    print(f"  {feat['col']:<30} mean score = {mean_val:.2f}  "
+          f"(weight={feat['weight']})")
+
+print(f"\nSample BOT rows (top 10 by final_score):")
+sample_cols = [COL_UUID, "final_score", "final_label"] + \
+              [f"score_{f['col']}" for f in FEATURE_CONFIG]
+sample_cols = [c for c in sample_cols if c in df_bots.columns]
+print(df_bots.sort_values("final_score", ascending=False)
+             .head(10)[sample_cols]
+             .to_string(index=False))
+
+# ── Save ──────────────────────────────────────────────────────
+print(f"\n[5/5] Saving output...")
+df_out.to_csv(OUTPUT_FILE, index=False, float_format="%.2f")
+print(f"\n[DONE] Saved → {OUTPUT_FILE}")
+print(f"       Rows: {len(df_out)}")
+print(f"       New columns: {score_cols}")
+print(f"""
+HOW TO ADD A NEW FEATURE:
+  Add a new block to FEATURE_CONFIG:
+
+  {{
+      "col"    : "your_column_name",
+      "weight" : 1.0,
+      "inverse": False,
+      "bins"   : [
+          (100,  0),
+          (200,  5),
+          (None, 10),
+      ],
+  }}
+
+HOW TO CHANGE A THRESHOLD:
+  Edit BOT_THRESHOLD at top of CONFIG section.
+  Currently: >= {BOT_THRESHOLD} → BOT, < {BOT_THRESHOLD} → SUSPECT
+
+HOW TO CHANGE BINS:
+  Edit the bins list for that feature in FEATURE_CONFIG.
+  Format: (upper_bound, score) — last entry always has None as upper_bound.
+
+Finished: {datetime.now():%Y-%m-%d %H:%M:%S}
+""")
