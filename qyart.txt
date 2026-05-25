@@ -1,0 +1,1 @@
+Users falling in the top quartile (percentile ≥ 0.75) represent the highest confidence BOTs within the flagged population — they not only exhibit consistent copy-paste submission patterns but also rank in the top 25% by activity volume, making automated behaviour statistically unlikely to be human.
