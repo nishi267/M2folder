@@ -1,0 +1,199 @@
+"""
+Post Processing: Percentile Score Computation
+Input : CSV output from isolation_forest_shap_clean.py
+        (contains original features + outlier + iforest_score + shap cols)
+Output: Same CSV with percentile scores + composite bot_confidence_score added
+        Computed ONLY on rows where Model_label = BOT
+"""
+
+import pandas as pd
+import numpy as np
+
+# ══════════════════════════════════════════════════════════════
+# CONFIG  ← only section you need to change
+# ══════════════════════════════════════════════════════════════
+
+INPUT_FILE  = "outlier_detection_results_with_CVs.csv"   # ← your IF output CSV
+OUTPUT_FILE = "post_processed_with_percentiles.csv"
+
+# UUID column
+COL_UUID = "uuid"
+
+# Model label column and BOT value
+COL_MODEL_LABEL = "Model_label"      # column that has BOT / NON BOT
+BOT_LABEL       = "BOT"              # exact string used for BOT rows
+
+# Isolation forest score column
+COL_IFOREST_SCORE = "iforest_score"
+
+# ── PERCENTILE FEATURES ──────────────────────────────────────
+# Add or remove features here as needed
+# For each feature, specify:
+#   "column"  : exact column name in your CSV
+#   "higher_is_more_bot" : True  → higher value = more bot-like (normal rank)
+#                          False → lower value  = more bot-like (inverted rank)
+
+PERCENTILE_FEATURES = [
+    {"column": "average_submission_rate",       "higher_is_more_bot": True},
+    {"column": "total_comm_ct",                 "higher_is_more_bot": True},
+    {"column": "avg_mean_comm_len",             "higher_is_more_bot": True},
+    {"column": "pattern_repeat_ratio",          "higher_is_more_bot": True},
+    {"column": "active_day_ct",                 "higher_is_more_bot": True},
+    {"column": "average_word_submission",       "higher_is_more_bot": True},
+    # iforest_score: more NEGATIVE = more anomalous = more bot
+    # so higher_is_more_bot = False (lower raw value = more bot)
+    {"column": "iforest_score",                 "higher_is_more_bot": False},
+]
+
+# Composite threshold: rows >= this score → BOT, below → SUSPECT
+BOT_CONFIDENCE_THRESHOLD = 0.60
+
+# Decimal places for output
+ROUND_DP = 2
+
+# ══════════════════════════════════════════════════════════════
+# 1) LOAD
+# ══════════════════════════════════════════════════════════════
+print("=" * 55)
+print("POST PROCESSING — PERCENTILE SCORE COMPUTATION")
+print("=" * 55)
+
+df = pd.read_csv(INPUT_FILE)
+df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+print(f"\nLoaded: {len(df)} rows  |  {df[COL_UUID].nunique()} UUIDs")
+print(f"Model label distribution:\n{df[COL_MODEL_LABEL].value_counts().to_string()}")
+
+# ══════════════════════════════════════════════════════════════
+# 2) ISOLATE BOT ROWS — percentiles computed within BOTs only
+# ══════════════════════════════════════════════════════════════
+bot_mask  = df[COL_MODEL_LABEL] == BOT_LABEL
+df_bots   = df[bot_mask].copy()
+n_bots    = len(df_bots)
+
+print(f"\nComputing percentiles on {n_bots} BOT rows only...")
+
+if n_bots == 0:
+    raise SystemExit(f"No rows found with {COL_MODEL_LABEL} == '{BOT_LABEL}'")
+
+# ══════════════════════════════════════════════════════════════
+# 3) VALIDATE FEATURES EXIST
+# ══════════════════════════════════════════════════════════════
+missing = [f["column"] for f in PERCENTILE_FEATURES
+           if f["column"] not in df_bots.columns]
+if missing:
+    print(f"\nWARNING: These columns not found and will be skipped: {missing}")
+    PERCENTILE_FEATURES = [f for f in PERCENTILE_FEATURES
+                           if f["column"] not in missing]
+
+# ══════════════════════════════════════════════════════════════
+# 4) COMPUTE PERCENTILE PER FEATURE
+#
+# rank(pct=True) converts each raw value to its position (0-1)
+# within the BOT group:
+#   lowest value  → 1/n  (e.g. 0.016 for 64 BOTs)
+#   highest value → 1.00
+#
+# For features where LOWER = more bot (e.g. iforest_score):
+#   we INVERT: percentile = 1 - rank(pct=True)
+#   so most negative score → 1.00 (highest confidence)
+# ══════════════════════════════════════════════════════════════
+pct_col_names = []
+
+print(f"\n{'Feature':<35} {'Direction':<25} {'Percentile Col'}")
+print("-" * 75)
+
+for feat in PERCENTILE_FEATURES:
+    col      = feat["column"]
+    higher   = feat["higher_is_more_bot"]
+    pct_col  = f"pct_{col}"
+
+    # Ensure numeric
+    df_bots[col] = pd.to_numeric(df_bots[col], errors="coerce")
+
+    if higher:
+        # Higher raw value = more bot = higher percentile (normal)
+        df_bots[pct_col] = df_bots[col].rank(pct=True).round(ROUND_DP)
+        direction = "higher → more bot (normal)"
+    else:
+        # Lower raw value = more bot = invert rank
+        df_bots[pct_col] = (1 - df_bots[col].rank(pct=True)).round(ROUND_DP)
+        direction = "lower → more bot (inverted)"
+
+    pct_col_names.append(pct_col)
+    print(f"  {col:<33} {direction:<25} {pct_col}")
+
+# ══════════════════════════════════════════════════════════════
+# 5) COMPOSITE SCORE = AVERAGE OF ALL PERCENTILES
+# ══════════════════════════════════════════════════════════════
+df_bots["bot_confidence_score"] = (
+    df_bots[pct_col_names].mean(axis=1).round(ROUND_DP)
+)
+
+# ══════════════════════════════════════════════════════════════
+# 6) FINAL LABEL — BOT vs SUSPECT
+# ══════════════════════════════════════════════════════════════
+df_bots["final_label"] = df_bots["bot_confidence_score"].apply(
+    lambda x: "BOT" if x >= BOT_CONFIDENCE_THRESHOLD else "SUSPECT"
+)
+
+# ══════════════════════════════════════════════════════════════
+# 7) MERGE BACK TO FULL DATASET
+# Non-BOT rows get NaN for percentile cols (they were not scored)
+# ══════════════════════════════════════════════════════════════
+new_cols  = pct_col_names + ["bot_confidence_score", "final_label"]
+df_output = df.merge(
+    df_bots[[COL_UUID] + new_cols],
+    on    = COL_UUID,
+    how   = "left"
+)
+
+# Non-BOT rows: fill final_label with their Model_label
+df_output["final_label"] = df_output["final_label"].fillna(
+    df_output[COL_MODEL_LABEL]
+)
+
+# ══════════════════════════════════════════════════════════════
+# 8) DIAGNOSTICS
+# ══════════════════════════════════════════════════════════════
+print(f"\n{'='*55}")
+print("RESULTS")
+print(f"{'='*55}")
+
+print(f"\nFinal label distribution:")
+print(df_output["final_label"].value_counts().to_string())
+
+print(f"\nBOT confidence score stats (BOT rows only):")
+print(df_bots["bot_confidence_score"].describe().round(ROUND_DP).to_string())
+
+print(f"\nSample BOT rows (top 10 by confidence):")
+sample_cols = ([COL_UUID, COL_IFOREST_SCORE, "bot_confidence_score", "final_label"]
+               + pct_col_names[:3])   # show first 3 pct cols as sample
+sample_cols = [c for c in sample_cols if c in df_output.columns]
+print(df_output[df_output[COL_MODEL_LABEL] == BOT_LABEL]
+      .sort_values("bot_confidence_score", ascending=False)
+      .head(10)[sample_cols]
+      .to_string(index=False))
+
+# ══════════════════════════════════════════════════════════════
+# 9) SAVE
+# ══════════════════════════════════════════════════════════════
+df_output.to_csv(OUTPUT_FILE, index=False, float_format="%.2f")
+print(f"\n[DONE] Saved → {OUTPUT_FILE}")
+print(f"       Rows: {len(df_output)}  |  New columns added: {new_cols}")
+print(f"""
+OUTPUT COLUMNS ADDED:
+  pct_<feature>          → percentile rank of that feature within BOT group (0-1)
+  bot_confidence_score   → average of all percentiles (0-1)
+                           higher = more confident this is a true BOT
+  final_label            → BOT (score>={BOT_CONFIDENCE_THRESHOLD}) 
+                           or SUSPECT (score<{BOT_CONFIDENCE_THRESHOLD})
+                           NON BOT rows keep their original label
+
+TO CHANGE FEATURES:
+  Edit PERCENTILE_FEATURES list at top of script
+  Set higher_is_more_bot=True  if higher value means more bot-like
+  Set higher_is_more_bot=False if lower value means more bot-like (e.g. iforest_score)
+
+TO CHANGE THRESHOLD:
+  Edit BOT_CONFIDENCE_THRESHOLD (currently {BOT_CONFIDENCE_THRESHOLD})
+""")
