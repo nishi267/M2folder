@@ -1,0 +1,11 @@
+{
+    "col"    : "iforest_score",
+    "weight" : 1.0,
+    "inverse": True,      # more negative = more anomalous = higher score
+    "bins"   : [
+        (-0.70,  10),     # strongest anomaly
+        (-0.65,   7.5),   # moderate-strong
+        (-0.60,   5),     # moderate
+        (None,    0),     # borderline
+    ],
+},
